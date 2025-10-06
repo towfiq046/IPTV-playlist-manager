@@ -1,0 +1,19 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+.env
+
+clean_playlists/
+input_playlists/
+reports/
+config.json
+playlists.json
+repo-tree.txt

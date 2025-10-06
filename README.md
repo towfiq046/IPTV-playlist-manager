@@ -2,8 +2,6 @@
 
 A powerful, command-line tool designed to automate the cleaning, maintenance, and security scanning of your IPTV M3U playlists. This script fetches remote and local playlists, checks every link's health, scans domains against the VirusTotal API for threats, and generates clean, safe playlist files based on your custom rules.
 
-*(Note: You can replace this with a real screenshot of your tool in action!)*
-
 ## ✨ Key Features
 
 - **Automatic Playlist Fetching**: Gathers playlists from remote URLs (`playlists.json`) and local files (`input_playlists/` directory).

@@ -119,7 +119,8 @@ async def process_url(session, domain, url, semaphore):
                     logging.error("VirusTotal API Key is invalid or unauthorized.")
                 elif response.status != 404:
                     logging.warning(f"Unexpected status {response.status} for {domain}")
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as e:
+            # Catch RuntimeError here as well to handle the "Session is closed" case gracefully within the task
             logging.error(f"NETWORK ERROR for {domain}: {e}")
             return domain, None
 
@@ -146,7 +147,7 @@ def _save_scan_progress(results_db: dict, remaining_domains: set):
     # Save the latest results
     RESULTS_DB_FILE.write_text(json.dumps(results_db, indent=2))
 
-    # Save the remaining queue
+    # Save or delete the remaining queue
     if remaining_domains:
         SCAN_QUEUE_FILE.write_text(json.dumps(list(remaining_domains)))
     elif SCAN_QUEUE_FILE.exists():
@@ -232,23 +233,33 @@ async def _run_scanner_loop(
                 for domain in domains_to_scan
             ]
             for future in asyncio.as_completed(tasks):
+                domain, stats = None, None
+                try:
+                    # This is where exceptions from the tasks will be raised
+                    domain, stats = await future
+                except Exception as e:
+                    # This is the key change: we catch errors here to prevent the loop from crashing
+                    logging.error(
+                        f"A scanner task failed unexpectedly: {e}. The script will continue."
+                    )
+
+                pbar.update(1)  # Always update the progress bar
+
                 if QUOTA_EXHAUSTED:
                     pbar.set_description_str(f"{C.RED}SCAN ABORTED (Quota){C.RESET}")
+                    # Break the inner loop, the 'finally' block will then save progress
                     break
 
-                domain, stats = await future
-                pbar.update(1)
-                remaining_domains.discard(domain)
-
-                if stats:
-                    results_db[domain] = stats
-                    new_results_count += 1
-                    # Save progress in batches
-                    if new_results_count % BATCH_SAVE_SIZE == 0:
-                        _save_scan_progress(results_db, remaining_domains)
-                        pbar.set_description_str(
-                            f"{C.CYAN}🚀 Scanning Domains (Progress Saved){C.RESET}"
-                        )
+                if domain:
+                    remaining_domains.discard(domain)
+                    if stats:
+                        results_db[domain] = stats
+                        new_results_count += 1
+                        if new_results_count % BATCH_SAVE_SIZE == 0:
+                            _save_scan_progress(results_db, remaining_domains)
+                            pbar.set_description_str(
+                                f"{C.CYAN}🚀 Scanning Domains (Progress Saved){C.RESET}"
+                            )
     finally:
         pbar.close()
         _save_scan_progress(results_db, remaining_domains)
@@ -304,7 +315,13 @@ def scan_playlists(
         _run_scanner_loop(domains_to_scan, url_map, results_db)
     )
 
-    scan_status = "aborted" if QUOTA_EXHAUSTED else "finished"
+    scan_status = "finished"
+    if QUOTA_EXHAUSTED:
+        scan_status = "aborted due to quota"
+    # Check if the queue file still exists and has content.
+    elif SCAN_QUEUE_FILE.exists() and SCAN_QUEUE_FILE.stat().st_size > 0:
+        scan_status = "interrupted"
+
     logging.info(
         f"Scan {scan_status}. Added or updated {new_results_count} results in the database."
     )

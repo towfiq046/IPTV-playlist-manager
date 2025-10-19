@@ -108,8 +108,8 @@ def load_json_config(file_path, default=None):
             return merged_config
         return user_config
     except json.JSONDecodeError:
-        logging.error(
-            f"Syntax error in '{file_path.name}'. Please check the JSON formatting."
+        print(
+            f"{C.RED}ERROR: Syntax error in '{file_path.name}'. Please check the JSON formatting.{C.RESET}"
         )
         return None
 
@@ -202,7 +202,7 @@ def get_quota_tracker() -> ApiQuotaTracker:
 
 def initialize_project():
     print(f"{C.BRIGHT}{C.MAGENTA}============================================{C.RESET}")
-    print(f"{C.BRIGHT}{C.MAGENTA}=== Hybrid Playlist Scanner v4.6 (Final) ==={C.RESET}")
+    print(f"{C.BRIGHT}{C.MAGENTA}=== IPTV Playlist Scanner v4.6 (Final) ==={C.RESET}")
     print(f"{C.BRIGHT}{C.MAGENTA}============================================{C.RESET}")
 
     import os

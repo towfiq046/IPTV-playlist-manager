@@ -76,18 +76,17 @@ def report_and_clean(
     print(
         f"Identified a total of {C.RED}{len(blocked_domains)}{C.RESET} domains to block based on your rules."
     )
-    playlist_reports = {fn: {"removed_channels": {}} for fn in playlists_with_content}
-    domain_cross_ref = {
-        dom: {"reason": rea, "found_in": []} for dom, rea in blocked_domains.items()
+    playlist_reports = {
+        fn: {"removed_channels": {}, "became_empty": False}
+        for fn in playlists_with_content
     }
+
+    # Start with an empty cross-reference. We only add to it when a domain is actually found.
+    domain_cross_ref = {}
 
     for filename, content in playlists_with_content.items():
         header, logical_entries = parse_m3u_to_logical_entries(content)
-
-        clean_output_lines = []
-        if header:
-            clean_output_lines.append(header[0])
-
+        clean_output_lines = header[:]
         malicious_removed_count = 0
         dead_removed_count = 0
 
@@ -96,12 +95,21 @@ def report_and_clean(
                 continue
 
             is_entry_malicious = False
-            clean_urls_for_this_entry = []
-
             for url in entry["urls"]:
                 domain = get_domain_from_url(url)
                 if domain in blocked_domains:
                     is_entry_malicious = True
+
+                    # If this is the first time we've seen this malicious domain this run, create its entry.
+                    if domain not in domain_cross_ref:
+                        domain_cross_ref[domain] = {
+                            "reason": blocked_domains[domain],
+                            "found_in": [],
+                        }
+
+                    # Add the current playlist to its list (if not already present).
+                    if filename not in domain_cross_ref[domain]["found_in"]:
+                        domain_cross_ref[domain]["found_in"].append(filename)
 
                     if entry["metadata"]:
                         extinf_line = entry["metadata"][0]
@@ -128,14 +136,14 @@ def report_and_clean(
                                 domain
                             ].append(channel_name)
 
-                        if filename not in domain_cross_ref[domain]["found_in"]:
-                            domain_cross_ref[domain]["found_in"].append(filename)
+                    # We found a malicious URL in this entry, no need to check others in the same entry.
                     break
 
             if is_entry_malicious:
                 malicious_removed_count += 1
                 continue
 
+            clean_urls_for_this_entry = []
             for url in entry["urls"]:
                 is_dead = (
                     CONFIG.get("features", {}).get("auto_remove_dead_links", False)
@@ -150,11 +158,18 @@ def report_and_clean(
                 clean_output_lines.extend(entry["metadata"])
                 clean_output_lines.extend(clean_urls_for_this_entry)
 
+        is_now_empty = len(clean_output_lines) <= 1
+        if is_now_empty:
+            playlist_reports[filename]["became_empty"] = True
+            print(
+                f"  -> ⚠️  Processed '{C.YELLOW}{filename}{C.RESET}': Playlist is now EMPTY after removing {C.RED}{malicious_removed_count}{C.RESET} malicious entries and {C.YELLOW}{dead_removed_count}{C.RESET} dead links."
+            )
+        else:
+            print(
+                f"  -> Processed '{C.YELLOW}{filename}{C.RESET}': Discarded {C.RED}{malicious_removed_count}{C.RESET} malicious entries and {C.YELLOW}{dead_removed_count}{C.RESET} dead links. Produced clean output."
+            )
+
         final_content = "\n".join(clean_output_lines)
         (CLEAN_DIR / filename).write_text(final_content + "\n", encoding="utf-8")
-
-        print(
-            f"  -> Processed '{C.YELLOW}{filename}{C.RESET}': Discarded {C.RED}{malicious_removed_count}{C.RESET} malicious entries and {C.YELLOW}{dead_removed_count}{C.RESET} dead links. Produced well-formatted output."
-        )
 
     return playlist_reports, domain_cross_ref, blocked_domains

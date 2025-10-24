@@ -21,10 +21,11 @@ from iptv_manager.vt_scanner import scan_playlists
 CONFIG = get_config()
 
 
-def merge_clean_playlists():
+def merge_clean_playlists() -> dict:
     """
     Combines all generated clean playlists into a single master file,
     intelligently removing entries with duplicate stream URLs.
+    Returns a dictionary of statistics for the report.
     """
     master_playlist_path = CLEAN_DIR / "_MASTER_PLAYLIST.m3u"
     print(f"\n{C.BRIGHT}---  consolidating playlists & de-duplicating ---{C.RESET}")
@@ -35,7 +36,7 @@ def merge_clean_playlists():
 
     if not clean_files:
         logging.warning("No clean playlist files found to merge.")
-        return
+        return {}
 
     seen_urls = set()
     master_content_lines = ["#EXTM3U"]
@@ -44,16 +45,13 @@ def merge_clean_playlists():
 
     for playlist_file in clean_files:
         content = playlist_file.read_text(encoding="utf-8")
-        # Use the existing robust parser to break the file into logical entries
         _header, logical_entries = parse_m3u_to_logical_entries(content)
 
         for entry in logical_entries:
             total_entries_processed += 1
-            # An entry might have multiple URLs, though it's rare. We handle it.
             if not entry.get("urls"):
                 continue
 
-            # We will only keep the metadata and the URLs that are new.
             unique_urls_for_this_entry = []
             for url in entry["urls"]:
                 if url not in seen_urls:
@@ -62,7 +60,6 @@ def merge_clean_playlists():
                 else:
                     duplicate_streams_removed += 1
 
-            # If we found at least one new, unique URL, add the channel entry.
             if unique_urls_for_this_entry:
                 master_content_lines.extend(entry["metadata"])
                 master_content_lines.extend(unique_urls_for_this_entry)
@@ -71,18 +68,28 @@ def merge_clean_playlists():
         "\n".join(master_content_lines) + "\n", encoding="utf-8"
     )
 
+    # Final count excludes the #EXTM3U header
+    final_channel_count = sum(
+        1 for line in master_content_lines if line.startswith("#EXTINF")
+    )
+
     print(f"✅ Successfully merged {len(clean_files)} playlists.")
     print(
         f"   -> Processed {total_entries_processed} entries and removed {C.YELLOW}{duplicate_streams_removed}{C.RESET} duplicate streams."
     )
     print(
-        f"   -> Your final master playlist is '{C.CYAN}{master_playlist_path.name}{C.RESET}'"
+        f"   -> Your final master playlist with {C.GREEN}{final_channel_count}{C.RESET} channels is '{C.CYAN}{master_playlist_path.name}{C.RESET}'"
     )
+
+    return {
+        "processed": total_entries_processed,
+        "removed": duplicate_streams_removed,
+        "final_count": final_channel_count,
+    }
 
 
 def main():
     """Main workflow now driven by command-line arguments."""
-
     parser = argparse.ArgumentParser(description="IPTV Playlist Manager & Scanner v4.5")
     parser.add_argument(
         "--skip-health-check",
@@ -95,9 +102,7 @@ def main():
         help="Force a rescan of all domains, ignoring the cache.",
     )
     parser.add_argument(
-        "--init",
-        action="store_true",
-        help="Create default config.json, playlists.json, and .env files.",
+        "--init", action="store_true", help="Create default config files."
     )
     args = parser.parse_args()
 
@@ -108,8 +113,9 @@ def main():
     setup_logging()
     run_stats = initialize_project()
 
-    playlists_with_content = fetch_playlists()
+    playlists_with_content, playlist_actions = fetch_playlists()
     if not playlists_with_content:
+        print(f"{C.RED}No playlists were loaded. Exiting workflow.{C.RESET}")
         return
 
     health_reports, dead_links = {}, set()
@@ -133,16 +139,17 @@ def main():
         playlists_with_content, health_reports, dead_links
     )
 
+    merge_stats = merge_clean_playlists()
+
     generate_summary_report(
         run_stats,
         health_reports,
         playlist_reports,
         domain_cross_ref,
         blocked_domains,
+        playlist_actions,
+        merge_stats,
     )
-
-    # Merge all the clean files into a single master playlist
-    merge_clean_playlists()
 
     print(f"{C.BRIGHT}{C.GREEN}\n============================================{C.RESET}")
     print(f"{C.BRIGHT}{C.GREEN}===    Workflow Finished Successfully    ==={C.RESET}")

@@ -1,5 +1,6 @@
 import json
 import logging
+import shutil
 import sys
 from pathlib import Path
 
@@ -20,7 +21,7 @@ class C:
     CYAN = Fore.CYAN
 
 
-# --- Project Structure and File Paths are unchanged ---
+# --- Project Structure and File Paths ---
 SCRIPT_DIR = Path(__file__).parent.parent.resolve()
 INPUT_DIR = SCRIPT_DIR / "input_playlists"
 CLEAN_DIR = SCRIPT_DIR / "clean_playlists"
@@ -46,6 +47,7 @@ DEFAULT_CONFIG = {
         "check_link_health": True,
         "auto_remove_dead_links": True,
         "rescan_results_after_days": 30,
+        "recheck_disabled_after_days": 7,
     },
     "network_settings": {
         "playlist_timeout_seconds": 30,
@@ -61,7 +63,31 @@ DEFAULT_CONFIG = {
 }
 
 
+def save_playlist_config(config_data: dict):
+    """
+    Safely writes to the playlists.json file after first creating a backup.
+    """
+    backup_path = PLAYLIST_CONFIG_FILE.with_suffix(".json.bak")
+    try:
+        # Create a backup before every write operation
+        if PLAYLIST_CONFIG_FILE.exists():
+            shutil.copy2(PLAYLIST_CONFIG_FILE, backup_path)
+            logging.info(
+                f"Created a backup of your playlist config at '{backup_path.name}'"
+            )
+
+        PLAYLIST_CONFIG_FILE.write_text(json.dumps(config_data, indent=2))
+    except Exception as e:
+        logging.critical(
+            f"FATAL: Could not save playlist configuration to '{PLAYLIST_CONFIG_FILE.name}': {e}"
+        )
+        logging.critical(
+            "Your original file should be safe. Please check permissions and file integrity."
+        )
+
+
 def create_default_files():
+    """Creates default configuration files if they don't exist."""
     print("--- Running Initial Setup ---")
     if not APP_CONFIG_FILE.exists():
         print(f"Creating default '{APP_CONFIG_FILE.name}'...")
@@ -69,7 +95,12 @@ def create_default_files():
 
     if not PLAYLIST_CONFIG_FILE.exists():
         print(f"Creating example '{PLAYLIST_CONFIG_FILE.name}'...")
-        default_playlists = {"example_playlist.m3u": "https://example.com/playlist.m3u"}
+        default_playlists = {
+            "playlists_to_fetch": {
+                "example_playlist.m3u": "https://example.com/playlist.m3u"
+            },
+            "disabled_playlists": {},
+        }
         PLAYLIST_CONFIG_FILE.write_text(json.dumps(default_playlists, indent=2))
 
     if not ENV_FILE.exists():
@@ -82,6 +113,7 @@ def create_default_files():
 
 
 def setup_logging():
+    """Configures the logging format and level."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
@@ -90,34 +122,58 @@ def setup_logging():
 
 
 def load_json_config(file_path, default=None):
+    """
+    Loads a JSON file, handling errors and gracefully falling back to a .bak file if available.
+    """
     if not file_path.exists():
         if default is not None:
             logging.warning(f"'{file_path.name}' not found. Using default settings.")
             return default
         logging.error(f"Required config file '{file_path.name}' not found.")
         return None
+
     try:
-        user_config = json.loads(file_path.read_text())
-        if default:
-            merged_config = default.copy()
-            for key, value in user_config.items():
-                if key in merged_config and isinstance(merged_config[key], dict):
-                    merged_config[key].update(value)
-                else:
-                    merged_config[key] = value
-            return merged_config
-        return user_config
+        # First, try to load the primary file
+        return json.loads(file_path.read_text())
     except json.JSONDecodeError:
-        print(
-            f"{C.RED}ERROR: Syntax error in '{file_path.name}'. Please check the JSON formatting.{C.RESET}"
+        logging.warning(
+            f"{C.YELLOW}WARNING: Syntax error in '{file_path.name}'. The file is malformed.{C.RESET}"
         )
-        return None
+        backup_path = file_path.with_suffix(file_path.suffix + ".bak")
+
+        if backup_path.exists():
+            logging.warning(
+                f"Attempting to fall back to the last known good configuration: '{backup_path.name}'"
+            )
+            try:
+                # If the primary fails, try to load the backup
+                backup_config = json.loads(backup_path.read_text())
+                print(
+                    f"{C.GREEN}Successfully loaded the backup configuration. The script will continue.{C.RESET}"
+                )
+                print(
+                    f"{C.YELLOW}ACTION REQUIRED: Please fix the syntax errors in '{file_path.name}' before the next run.{C.RESET}"
+                )
+                return backup_config
+            except json.JSONDecodeError:
+                # If the backup is ALSO broken, then we must stop.
+                logging.critical(
+                    f"CRITICAL: The backup file '{backup_path.name}' is also corrupted. Cannot proceed."
+                )
+                return None
+        else:
+            # If there's no backup to fall back to, we must stop.
+            logging.critical(
+                f"CRITICAL: '{file_path.name}' is corrupted and no backup file was found. Cannot proceed."
+            )
+            return None
 
 
 _CONFIG = load_json_config(APP_CONFIG_FILE, default=DEFAULT_CONFIG)
 
 
 def get_config() -> dict:
+    """Returns the loaded application configuration."""
     if _CONFIG is None:
         logging.critical(
             "Could not load application configuration from 'config.json'. Exiting."
@@ -127,6 +183,8 @@ def get_config() -> dict:
 
 
 class ApiQuotaTracker:
+    """Fetches and displays the final VirusTotal API quota."""
+
     def __init__(self, api_key, user_id):
         self.api_key = api_key
         self.user_id = user_id
@@ -194,6 +252,7 @@ _QUOTA_TRACKER: ApiQuotaTracker | None = None
 
 
 def get_quota_tracker() -> ApiQuotaTracker:
+    """Returns the singleton instance of the ApiQuotaTracker."""
     if _QUOTA_TRACKER is None:
         logging.critical("Quota tracker was not initialized. Critical program error.")
         sys.exit(1)
@@ -201,8 +260,9 @@ def get_quota_tracker() -> ApiQuotaTracker:
 
 
 def initialize_project():
+    """Initializes project directories, loads environment variables, and sets up the quota tracker."""
     print(f"{C.BRIGHT}{C.MAGENTA}============================================{C.RESET}")
-    print(f"{C.BRIGHT}{C.MAGENTA}=== IPTV Playlist Scanner v4.6 (Final) ==={C.RESET}")
+    print(f"{C.BRIGHT}{C.MAGENTA}=== Hybrid Playlist Scanner v4.6 (Final) ==={C.RESET}")
     print(f"{C.BRIGHT}{C.MAGENTA}============================================{C.RESET}")
 
     import os
@@ -223,7 +283,7 @@ def initialize_project():
     global _QUOTA_TRACKER
     _QUOTA_TRACKER = ApiQuotaTracker(api_key=api_key, user_id=user_id)
 
-    for dir_path in [INPUT_DIR, CLEAN_DIR, REPORTS_DIR]:
+    for dir_path in [INPUT_DIR, CLEAN_DIR, REPORTS_DIR, LOGS_DIR]:
         dir_path.mkdir(exist_ok=True)
 
     return {

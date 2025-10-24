@@ -16,4 +16,5 @@ input_playlists/
 reports/
 config.json
 playlists.json
+playlists.json.bak
 repo-tree.txt

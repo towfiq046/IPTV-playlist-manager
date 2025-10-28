@@ -3,8 +3,8 @@ import hashlib
 import json
 import logging
 import os
-import re
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse  # NEW
 
 import aiohttp
 from dotenv import load_dotenv
@@ -18,7 +18,9 @@ from .config_loader import (
     get_config,
     load_json_config,
 )
-from .utils import get_domain_from_url
+
+# MODIFIED: get_domain_from_url no longer needed here
+# from .utils import get_domain_from_url
 
 CONFIG = get_config()
 load_dotenv(dotenv_path=ENV_FILE)
@@ -63,21 +65,23 @@ async def submit_url_for_analysis(session, url, headers):
     submit_url = "https://www.virustotal.com/api/v3/urls"
     payload = {"url": url}
     try:
+        # --- MODIFIED: Log the domain from the representative url ---
+        domain_of_url = urlparse(url).netloc
         async with session.post(submit_url, headers=headers, data=payload) as response:
             if response.status == 200:
                 logging.info(
-                    f"Successfully submitted new URL for {get_domain_from_url(url)} for analysis."
+                    f"Successfully submitted new URL for {domain_of_url} for analysis."
                 )
                 URLS_SUBMITTED_THIS_RUN += 1
             elif response.status == 429:
                 logging.warning("Rate limit hit while submitting URL. Will not retry.")
             elif response.status == 400 and "already exists" in (await response.text()):
                 logging.debug(
-                    f"URL for {get_domain_from_url(url)} was already submitted recently."
+                    f"URL for {domain_of_url} was already submitted recently."
                 )
             else:
                 logging.warning(
-                    f"Failed to submit URL for {get_domain_from_url(url)}. Status: {response.status}"
+                    f"Failed to submit URL for {domain_of_url}. Status: {response.status}"
                 )
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         logging.error(f"NETWORK ERROR during URL submission: {e}")
@@ -154,8 +158,8 @@ def _save_scan_progress(results_db: dict, remaining_domains: set):
         SCAN_QUEUE_FILE.unlink()
 
 
-def _determine_domains_to_scan(
-    all_domains: set, results_db: dict, force_rescan: bool
+def _determine_domains_to_scan(  # MODIFIED: Renamed variable for clarity
+    master_domain_list: set, results_db: dict, force_rescan: bool
 ) -> set:
     """Determines which domains need scanning based on cache, expiry, and user flags."""
     # Priority 1: Resume from an incomplete scan
@@ -174,9 +178,9 @@ def _determine_domains_to_scan(
     # Priority 2: Force a full rescan of everything
     if force_rescan:
         print(
-            f"{C.YELLOW}Forcing a full rescan of all {len(all_domains)} domains.{C.RESET}"
+            f"{C.YELLOW}Forcing a full rescan of all {len(master_domain_list)} domains.{C.RESET}"
         )
-        return all_domains
+        return master_domain_list
 
     # Priority 3: Standard scan (new and expired domains)
     domains_to_scan = set()
@@ -184,7 +188,7 @@ def _determine_domains_to_scan(
     expiry_date_threshold = datetime.now(timezone.utc) - timedelta(days=rescan_days)
     expired_count = 0
 
-    for domain in all_domains:
+    for domain in master_domain_list:  # MODIFIED: using master list
         if domain not in results_db:
             domains_to_scan.add(domain)
         else:
@@ -200,7 +204,9 @@ def _determine_domains_to_scan(
                 domains_to_scan.add(domain)  # Rescan if date is invalid
 
     new_count = len(domains_to_scan) - expired_count
-    logging.info(f"Found {C.CYAN}{len(all_domains)}{C.RESET} unique domains.")
+    logging.info(
+        f"Found {C.CYAN}{len(master_domain_list)}{C.RESET} unique domains."
+    )  # MODIFIED
     if new_count > 0:
         logging.info(f"-> {C.GREEN}{new_count}{C.RESET} are new.")
     if expired_count > 0:
@@ -212,9 +218,29 @@ def _determine_domains_to_scan(
 
 
 async def _run_scanner_loop(
-    domains_to_scan: set, url_map: dict, results_db: dict
+    domains_to_scan: set, domain_to_rep_url: dict, results_db: dict
 ) -> int:
     """The main asynchronous loop that manages and executes the scans."""
+
+    # 1. Prune the scan queue of any domains that are no longer relevant.
+    original_queued_count = len(domains_to_scan)
+    # This keeps only the domains that are BOTH in the queue AND in the current master list.
+    domains_to_scan.intersection_update(domain_to_rep_url.keys())
+    pruned_count = original_queued_count - len(domains_to_scan)
+
+    if pruned_count > 0:
+        logging.warning(
+            f"Skipped {pruned_count} stale domains from the queue that are no longer in the playlists."
+        )
+
+    # 2. If after pruning there's nothing left to do, exit gracefully.
+    if not domains_to_scan:
+        logging.info("All remaining domains in the queue were stale. Nothing to scan.")
+        # Clean up the old queue file
+        if SCAN_QUEUE_FILE.exists():
+            SCAN_QUEUE_FILE.unlink()
+        return 0
+
     remaining_domains = domains_to_scan.copy()
     new_results_count = 0
     BATCH_SAVE_SIZE = 10
@@ -229,25 +255,26 @@ async def _run_scanner_loop(
     try:
         async with aiohttp.ClientSession() as session:
             tasks = [
-                process_url(session, domain, url_map[domain], semaphore)
+                process_url(session, domain, domain_to_rep_url[domain], semaphore)
                 for domain in domains_to_scan
+                # The safety check below is now redundant because of our prune step,
+                # but it's good practice to keep it.
+                if domain in domain_to_rep_url
             ]
             for future in asyncio.as_completed(tasks):
                 domain, stats = None, None
                 try:
-                    # This is where exceptions from the tasks will be raised
                     domain, stats = await future
                 except Exception as e:
-                    # This is the key change: we catch errors here to prevent the loop from crashing
                     logging.error(
                         f"A scanner task failed unexpectedly: {e}. The script will continue."
                     )
 
-                pbar.update(1)  # Always update the progress bar
+                pbar.update(1)
 
+                # This part is for the temporary rate limit, which we will keep
                 if QUOTA_EXHAUSTED:
                     pbar.set_description_str(f"{C.RED}SCAN ABORTED (Quota){C.RESET}")
-                    # Break the inner loop, the 'finally' block will then save progress
                     break
 
                 if domain:
@@ -275,36 +302,29 @@ async def _run_scanner_loop(
 
 
 def scan_playlists(
-    playlists_with_content: dict, force_rescan: bool = False
+    master_domain_list: set,
+    domain_to_rep_url: dict,
+    force_rescan: bool = False,
 ) -> tuple[int, int]:
     """
     Orchestrates the entire domain scanning workflow.
-    1. Extracts all unique domains from playlists.
-    2. Determines which domains need to be scanned.
-    3. Runs the asynchronous scanner.
-    4. Returns the results.
+    1. Determines which domains from the master list need to be scanned.
+    2. Runs the asynchronous scanner using representative URLs.
+    3. Returns the results.
     """
     global URLS_SUBMITTED_THIS_RUN
     URLS_SUBMITTED_THIS_RUN = 0
 
     print(f"\n{C.BRIGHT}--- 🛡️  PHASE 2: SCANNING DOMAINS ---{C.RESET}")
 
-    # 1. Extract domains and create a URL map
-    url_pattern = re.compile(r'https?://[^\s"\'`<>]+')
-    all_domains, url_map = set(), {}
-    for content in playlists_with_content.values():
-        for url in url_pattern.findall(content):
-            domain = get_domain_from_url(url)
-            if domain and domain not in url_map:
-                all_domains.add(domain)
-                url_map[domain] = url
-
-    # 2. Load database and determine scan scope
+    # 1. Load database and determine scan scope
     results_db = load_json_config(RESULTS_DB_FILE, default={})
     if results_db is None:
         return 0, 0
 
-    domains_to_scan = _determine_domains_to_scan(all_domains, results_db, force_rescan)
+    domains_to_scan = _determine_domains_to_scan(
+        master_domain_list, results_db, force_rescan
+    )
 
     if not domains_to_scan:
         logging.info("No new or expired domains to scan. Database is up-to-date.")
@@ -312,7 +332,7 @@ def scan_playlists(
 
     # 3. Run the scanner
     new_results_count = asyncio.run(
-        _run_scanner_loop(domains_to_scan, url_map, results_db)
+        _run_scanner_loop(domains_to_scan, domain_to_rep_url, results_db)
     )
 
     scan_status = "finished"

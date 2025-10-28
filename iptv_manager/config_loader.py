@@ -21,6 +21,32 @@ class C:
     CYAN = Fore.CYAN
 
 
+class ColoredFormatter(logging.Formatter):
+    """A custom logging formatter that adds color based on log level."""
+
+    LOG_COLORS = {
+        logging.DEBUG: C.BLUE,
+        logging.INFO: C.GREEN,
+        logging.WARNING: C.YELLOW,
+        logging.ERROR: C.RED,
+        logging.CRITICAL: C.BRIGHT + C.RED,  # Make critical logs bright red
+    }
+
+    def format(self, record):
+        color = self.LOG_COLORS.get(record.levelno)
+        # The default Formatter class is an "old-style" class, so we must call the base
+        # class's format() method explicitly.
+        message = super().format(record)
+        if color:
+            # We only want to color the 'LEVELNAME:' part and the message itself,
+            # not the timestamp.
+            parts = message.split(record.levelname)
+            if len(parts) > 1:
+                # Reconstruct the message with color
+                message = f"{parts[0]}{color}{record.levelname}{C.RESET}{parts[1]}"
+        return message
+
+
 # --- Project Structure and File Paths ---
 SCRIPT_DIR = Path(__file__).parent.parent.resolve()
 INPUT_DIR = SCRIPT_DIR / "input_playlists"
@@ -114,11 +140,16 @@ def create_default_files():
 
 def setup_logging():
     """Configures the logging format and level."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+
+    if root_logger.hasHandlers():
+        root_logger.handlers.clear()
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    formatter = ColoredFormatter("%(asctime)s - %(levelname)s - %(message)s")
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
 
 
 def load_json_config(file_path, default=None):

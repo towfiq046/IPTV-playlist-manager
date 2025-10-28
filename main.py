@@ -18,6 +18,11 @@ from iptv_manager.playlist_manager import fetch_playlists, run_health_checks
 from iptv_manager.report_generator import generate_summary_report
 from iptv_manager.vt_scanner import scan_playlists
 
+# --- NEW ---
+from iptv_manager.url_resolver import resolve_and_map_urls
+import re
+# --- END NEW ---
+
 CONFIG = get_config()
 
 
@@ -90,7 +95,9 @@ def merge_clean_playlists() -> dict:
 
 def main():
     """Main workflow now driven by command-line arguments."""
-    parser = argparse.ArgumentParser(description="IPTV Playlist Manager & Scanner v4.5")
+    parser = argparse.ArgumentParser(
+        description="IPTV Playlist Manager & Scanner v5.0"
+    )  # MODIFIED version
     parser.add_argument(
         "--skip-health-check",
         action="store_true",
@@ -118,6 +125,19 @@ def main():
         print(f"{C.RED}No playlists were loaded. Exiting workflow.{C.RESET}")
         return
 
+    # --- NEW: URL RESOLUTION PHASE ---
+    # 1. Extract all unique URLs from all loaded playlists first.
+    url_pattern = re.compile(r'https?://[^\s"\'`<>]+')
+    all_urls = set()
+    for content in playlists_with_content.values():
+        all_urls.update(url_pattern.findall(content))
+
+    # 2. Run the new resolver to get our critical data maps.
+    redirect_map, master_domain_list, domain_to_rep_url = asyncio.run(
+        resolve_and_map_urls(all_urls)
+    )
+    # --- END NEW ---
+
     health_reports, dead_links = {}, set()
     run_health_check_config = CONFIG.get("features", {}).get("check_link_health", True)
     if not args.skip_health_check and run_health_check_config:
@@ -129,18 +149,21 @@ def main():
     else:
         logging.info("Skipping link health check phase as requested.")
 
+    # --- MODIFIED: Pass new data to scanner and cleaner ---
     new_scans_count, urls_submitted = scan_playlists(
-        playlists_with_content, args.force_rescan
+        master_domain_list, domain_to_rep_url, args.force_rescan
     )
     run_stats["new_scans_count"] = new_scans_count
     run_stats["urls_submitted_to_vt"] = urls_submitted
 
     playlist_reports, domain_cross_ref, blocked_domains = report_and_clean(
-        playlists_with_content, health_reports, dead_links
+        playlists_with_content, health_reports, dead_links, redirect_map
     )
+    # --- END MODIFIED ---
 
     merge_stats = merge_clean_playlists()
 
+    # --- MODIFIED: Pass new data to report generator ---
     generate_summary_report(
         run_stats,
         health_reports,
@@ -150,6 +173,7 @@ def main():
         playlist_actions,
         merge_stats,
     )
+    # --- END MODIFIED ---
 
     print(f"{C.BRIGHT}{C.GREEN}\n============================================{C.RESET}")
     print(f"{C.BRIGHT}{C.GREEN}===    Workflow Finished Successfully    ==={C.RESET}")

@@ -18,7 +18,7 @@ def generate_summary_report(
 ):
     """Generates a comprehensive and well-structured summary report."""
     with open(SUMMARY_REPORT_FILE, "w", encoding="utf-8") as f:
-        f.write("# 🛰️ Playlist Scan & Health Report v4.5\n\n")
+        f.write("# 🛰️ Playlist Scan & Health Report v5.0\n\n")  # MODIFIED version
         f.write(
             f"- **Report Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         )
@@ -136,15 +136,19 @@ def generate_summary_report(
                 "No malicious content was found in any playlist based on your rules.\n"
             )
         else:
+            # --- MODIFIED: Enhanced Reporting Logic ---
             for i, (filename, report) in enumerate(contaminated_playlists.items(), 1):
                 f.write(f"**{i}. Playlist: `{filename}`**\n")
-                for domain, channels in report["removed_channels"].items():
+                for domain, removed_items in report["removed_channels"].items():
                     f.write(
-                        f"   - **Domain `{domain}`:** (Reason: *{blocked_domains.get(domain)}*)\n"
+                        f"   - **Blocked Domain `{domain}`:** (Reason: *{blocked_domains.get(domain)}*)\n"
                     )
-                    for channel in channels:
-                        f.write(f"     - 🗑️ Removed Channel: `{channel}`\n")
+                    for item in removed_items:
+                        channel = item["channel"]
+                        reason = item["reason"]
+                        f.write(f"     - 🗑️ Removed Channel: `{channel}` (*{reason}*)\n")
                 f.write("\n")
+            # --- END MODIFIED ---
 
         f.write("---\n\n### 🗺️ Part 3: Master Blocklist Cross-Reference\n\n")
         if not domain_cross_ref:

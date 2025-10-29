@@ -1,180 +1,190 @@
-# 🛰️ IPTV Playlist Manager & Scanner
+# IPTV Manager & Zero-Tolerance Scanner
 
-A powerful, robust, and self-healing command-line tool designed to completely automate the maintenance and security of your IPTV M3U playlists.
+![License](https://img.shields.io/badge/License-MIT-yellow.svg)
+![Python](https://img.shields.io/badge/python-3.10+-blue.svg)
 
-This script fetches remote and local playlists concurrently, validates every link's health, scans domains against VirusTotal for threats, and generates a single, de-duplicated master playlist. It's architected with safety first: your configuration is automatically backed up, and the script can even recover from syntax errors in your config file, ensuring it runs reliably every time.
+A powerful, automated tool for fetching, cleaning, and security-scanning IPTV playlists. This script ensures a safe, high-quality, and de-duplicated viewing experience by leveraging the VirusTotal API in a highly efficient manner.
 
-The goal is a true **"set-it-and-forget-it"** solution: run the script, update a single online file, and have all your IPTV players refresh automatically with clean, reliable, and safe content.
+The core philosophy is **"Zero-Tolerance"**: if any URL (stream, logo, EPG, etc.) within a channel's entry is associated with a malicious or suspicious domain, that specific stream is rigorously removed, guaranteeing the cleanliness of your final playlists.
 
----
+## 🏆 Key Features
 
-## ✨ Key Features
+- **Comprehensive Security Scanning**: Scans every URL found in your playlists—not just the stream links—including EPG sources (`url-tvg`) and channel logos (`tvg-logo`)
 
-* 🛡️ **Safety First – Automatic Backups & Fallback**
+- **Zero-Tolerance Cleaning**: Any stream entry associated with a domain exceeding your defined malicious or suspicious thresholds is completely removed
 
-  * Your `playlists.json` is always safe. The script automatically creates a `.bak` file before making any changes.
-  * If you make a syntax error in `playlists.json`, the script won't crash. It will gracefully fall back to the last known good backup and continue running, warning you to fix the file.
+- **Redirect Chain Resolution**: Intelligently follows URL redirect chains to scan the true, final destination of a link, uncovering hidden threats
 
-* 🧠 **Self-Healing Automation**
+- **Dual Clean Output**: Generates both individually cleaned versions of your source playlists and a merged, de-duplicated master playlist
 
-  * **Auto-Disables Dead Playlists:** If a playlist URL returns a `404 Not Found`, it's automatically moved to a `disabled_playlists` section in your config.
-  * **Auto Re-enables Live Playlists:** The script periodically re-checks disabled playlists. If one comes back online, it's automatically re-enabled and moved back to the active list.
+- **Intelligent De-duplication**: The final master playlist contains only unique stream URLs, taking the first-seen version of any channel
 
-* 👑 **Intelligent Master Playlist Creation**
+- **Automated Source Management**: Automatically disables playlist sources that are offline (404) and re-enables them when they come back online
 
-  * Combines all your clean sources into a single, unified `_MASTER_PLAYLIST.m3u`.
-  * Smartly de-duplicates by stream URL, eliminating true redundancy while preserving unique backup streams for the same channel.
+- **Detailed Reporting**: Creates a professional, easy-to-read Markdown report (`summary_report.md`) with key metrics, source status, and a list of all domains that were blocked and why
 
-* ⚡ **High-Speed Concurrent Fetching:** Downloads all remote playlists simultaneously, dramatically reducing startup time.
+- **Independent Verification Script**: Includes a standalone script (`verify_cleanliness.py`) to audit the final master playlist and mathematically prove its cleanliness
 
-* ❤️ **Advanced Link Health Validation:** Asynchronously checks thousands of links for live status and valid stream content types.
+- **Efficient API Usage**: Prioritizes free report lookups from VirusTotal and only uses your API quota to submit new, unknown URLs for analysis
 
-* 🛡️ **VirusTotal Security Scanning:** Scans every unique domain against the VirusTotal database to identify and block malicious sources.
+## 🚀 How It Works
 
-* 📊 **Comprehensive & Accurate Reporting:** Generates a `reports/summary_report.md` with:
+The script operates in a clear, multi-phase workflow:
 
-  * A new Master Playlist summary.
-  * A Source Management section detailing which playlists were auto-enabled or disabled.
-  * A clean and accurate overview of all actions taken.
+### Phase 1: Fetch & Resolve
+- Fetches all active remote playlists defined in `playlists.json`
+- Reads all local playlists from the `input_playlists/` directory
+- Discovers every single URL (http/https) from all files
+- Resolves all URL redirect chains to build a comprehensive map of final destinations
 
----
+### Phase 2: Scan
+- Creates a master list of all unique domains discovered
+- Checks for existing VirusTotal reports for these domains (free)
+- Submits any new or unknown domains for analysis (uses API quota)
+- Saves all results to `reports/scan_results.json` to cache them for future runs
 
-## ⚙️ Requirements
+### Phase 3: Clean & Merge
+- Processes each playlist file individually
+- For each channel entry, it checks all associated domains against your zero-tolerance rules
+- It saves a clean version of each individual playlist
+- It adds the clean, unique streams to a master playlist, ensuring no duplicate stream URLs
 
-* Python **3.10+**
-* `uv` (recommended for fast dependency management)
-* A free VirusTotal API Key
+### Phase 4: Report
+- Generates the `summary_report.md` with detailed statistics and insights from the run
 
----
+## 🔧 Installation & Setup
 
-## 🚀 Installation & Setup
+**Prerequisites**: Python 3.10+
 
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/your-username/IPTV-playlist-manager.git
-cd IPTV-playlist-manager
+git clone <your-repository-url>
+cd iptv-manager-project
 ```
 
-### 2. Install Dependencies
+### 2. Set Up a Virtual Environment
+
+This project uses `uv` for fast dependency management.
+
+```bash
+# Create the virtual environment
+uv venv
+
+# Activate it (Linux/macOS)
+source .venv/bin/activate
+
+# Activate it (Windows)
+.venv\Scripts\activate
+```
+
+### 3. Install Dependencies
+
+`uv` will install the exact versions from the lock file.
 
 ```bash
 uv pip sync
 ```
 
-### 3. Run Initial Setup
+### 4. Run Initial Setup
 
-This creates the essential configuration files (`config.json`, `playlists.json`, `.env`).
+This crucial command creates the default configuration files you need to edit.
 
 ```bash
 python main.py --init
 ```
 
-### 4. Configure Your Credentials (CRITICAL STEP)
+### 5. Edit Configuration Files
 
-Open the newly created `.env` file and add your VirusTotal API Key and User ID.
+After running `--init`, you will have new files. Edit them as follows:
 
-> Log in to `VirusTotal.com`, click your user icon (top-right) and select **API Key**.
+#### `.env` (Required)
+Add your VirusTotal API key and User ID. You can find these in your VirusTotal account under the API Key section.
 
-```dotenv
-# .env
-VIRUSTOTAL_API_KEY=YOUR_API_KEY_HERE
-VT_USER_ID=YOUR_USER_ID_HERE
+```ini
+VIRUSTOTAL_API_KEY=your_virustotal_api_key_here
+VT_USER_ID=your_virustotal_user_id_or_username
 ```
 
-> **Warning:** Your API Key and User ID must belong to the **same account**, or you will receive a `403 Forbidden` error.
+#### `playlists.json` (Required)
+Add the remote playlists you want to fetch. The key is the filename it will be saved as.
 
-### 5. Add Your Playlists
+```json
+{
+  "playlists_to_fetch": {
+    "my_awesome_list.m3u": "http://example.com/playlist.m3u",
+    "another_list.m3u8": "http://another.com/list.m3u8"
+  },
+  "disabled_playlists": {}
+}
+```
 
-Edit `playlists.json` to add remote URLs, or place local `.m3u` files in the `input_playlists/` directory.
+You can also place `.m3u` or `.m3u8` files directly into the `input_playlists/` directory.
 
----
+#### `config.json` (Optional)
+The default settings are excellent, but you can fine-tune the script's behavior here. The most important section is `zero_tolerance_rules`.
 
-## 🛠️ The "One Playlist" Workflow
+```json
+{
+  "zero_tolerance_rules": {
+    "max_malicious_count": 0,  // Block if malicious votes are > 0
+    "max_suspicious_count": 2   // Block if suspicious votes are > 2
+  }
+}
+```
 
-This script is designed to give you a single, stable URL for all your players.
+## ▶️ Usage
 
-**Step 1: Run the Script Locally**
+To run the main script:
 
 ```bash
 python main.py
 ```
 
-**Step 2: Host Your Master Playlist on GitHub Gist**
+### Command-Line Arguments
 
-1. Navigate to [https://gist.github.com](https://gist.github.com).
-2. Create a new Gist (or edit an existing one).
+- `--skip-health-check`: Bypasses the optional (and slow) check for dead stream links. Cleaning is still performed.
+- `--force-rescan`: Forces a re-scan of all domains on VirusTotal, ignoring any cached results in `scan_results.json`.
+- `--init`: Use this only for the very first setup.
 
-   * **Filename:** `iptv_master.m3u`
-   * **Content:** Open the local `clean_playlists/_MASTER_PLAYLIST.m3u` file, copy its content, and paste it into the Gist.
-3. Click **Create public Gist** or **Update public Gist**.
+### Verifying the Results
 
-**Step 3: Get the Raw URL and Add to Your Player**
+After a run, you can use the standalone verification script to audit the master playlist:
 
-1. On your Gist page, click the **Raw** button.
-2. Copy the URL from your browser's address bar. This is your permanent playlist URL.
-3. Add this single URL to your IPTV player (Tivimate, etc.).
-
-Your routine is now simple: Run the script, then update the Gist content. Your players will automatically pull the changes.
-
----
-
-## 📄 Configuration Files Explained
-
-### `config.json`
-
-Fine-tune the script's behavior.
-
-* `decision_rules`:
-
-  * `malicious_threshold`: Block a domain if it has this many "malicious" votes.
-  * `force_block_domains`: A list of domains (e.g., `"example.com"`) to always block.
-  * `whitelist_domains`: A list of domains to never block.
-
-* `features`:
-
-  * `recheck_disabled_after_days`: (New!) How many days to wait before re-checking a disabled playlist to see if it's back online. Set to `0` to disable.
-  * `auto_remove_dead_links`: If `true`, dead links will be removed.
-  * `rescan_results_after_days`: How old a cached VirusTotal scan can be before a re-scan.
-
-* `network_settings`:
-
-  * Timeouts for downloading playlists and checking links.
-
-### `playlists.json`
-
-This file now has a new, more robust structure. The script will automatically upgrade your old file if needed.
-
-```json
-{
-  "playlists_to_fetch": {
-    "playlist_one.m3u": "https://example.com/playlist1.m3u",
-    "another_list.m3u8": "https://example.com/playlist2.m3u8"
-  },
-  "disabled_playlists": {
-    "dead_list.m3u": {
-      "url": "https://example.com/dead.m3u",
-      "disabled_on": "2025-10-26T10:00:00.000000"
-    }
-  }
-}
+```bash
+python verify_cleanliness.py
 ```
 
-* `playlists_to_fetch`: Your active playlist URLs.
-* `disabled_playlists`: Playlists the script has automatically disabled because they returned a `404 Not Found`. The script manages this section for you.
+This script acts as an independent auditor and will either give a "SUCCESS" or "FAILURE" message, proving that the cleaning process worked as expected.
+
+## 📁 Project Structure
+
+```
+IPTV_Manager/
+├── 📄 .env                     # Your API keys (secret)
+├── 📄 config.json              # Main script configuration
+├── 📄 playlists.json           # List of remote playlists to fetch
+├── 🐍 main.py                  # The main entry point to run the script
+├── 🐍 verify_cleanliness.py    # Standalone audit script
+│
+├── 📁 iptv_manager/            # Core logic modules
+│   ├── 🐍 cleaner.py           # Zero-tolerance cleaning and parsing logic
+│   ├── 🐍 config_loader.py     # Handles loading all configs and paths
+│   ├── 🐍 playlist_manager.py  # Fetches and manages playlist sources
+│   ├── 🐍 report_generator.py  # Creates the summary_report.md
+│   ├── 🐍 url_resolver.py      # Resolves redirect chains
+│   ├── 🐍 utils.py             # Small helper functions
+│   └── 🐍 vt_scanner.py        # All VirusTotal API interaction
+│
+├── 📁 input_playlists/         # Place local .m3u files here
+├── 📁 clean_playlists/         # OUTPUT: Cleaned individual and master playlists
+└── 📁 reports/                 # OUTPUT: Summary report and scan results
+```
+
+## 📜 License
+
+This project is licensed under the MIT License. See the LICENSE file for details.
 
 ---
 
-## 📋 Output
-
-* `clean_playlists/`: Contains the processed `.m3u` files and the final `_MASTER_PLAYLIST.m3u`.
-* `reports/summary_report.md`: The detailed, accurate report of the last run.
-* `playlists.json.bak`: A backup of your playlist configuration, created before any changes are made.
-
----
-
-## ⚖️ License
-
-This project is licensed under the **MIT License**.
-
----
+**Stay Safe. Stay Clean. Zero Tolerance.**

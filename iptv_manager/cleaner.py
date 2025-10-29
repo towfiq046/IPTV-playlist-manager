@@ -7,182 +7,178 @@ CONFIG = get_config()
 
 
 def parse_m3u_to_logical_entries(content: str) -> tuple[list, list]:
+    """
+    Parses M3U content into a header and a list of logical channel entries.
+    This new version strictly treats each stream URL as a separate entry,
+    carrying over the preceding metadata for non-standard multi-link entries.
+    """
     header = []
     entries = []
-    current_entry = {}
     lines = content.splitlines()
 
     if lines and lines[0].strip().upper() == "#EXTM3U":
         header.append(lines[0])
 
+    current_metadata = []
     for line in lines:
         line_stripped = line.strip()
         if not line_stripped or line_stripped.upper() == "#EXTM3U":
             continue
 
-        if line_stripped.startswith("#EXTINF"):
-            if current_entry:
-                entries.append(current_entry)
-            current_entry = {"metadata": [line], "urls": []}
-        elif line_stripped.startswith("#"):
-            if current_entry:
-                current_entry["metadata"].append(line)
-        elif line_stripped.startswith("http"):
-            if not current_entry:
-                current_entry = {"metadata": [], "urls": []}
-            current_entry["urls"].append(line)
+        if line_stripped.startswith("#"):
+            # If we find new #EXTINF metadata, it signals the start of a new channel block.
+            # We discard the previous metadata, as it should have been consumed by a URL.
+            if line_stripped.startswith("#EXTINF"):
+                current_metadata = [line]
+            else:
+                current_metadata.append(line)
 
-    if current_entry:
-        entries.append(current_entry)
+        elif line_stripped.startswith("http"):
+            # A URL line finalizes an entry.
+            if not current_metadata:
+                # This is an orphaned URL with no #EXTINF. Treat it as its own entry.
+                # While not ideal, we process it to ensure it gets scanned.
+                entries.append({"metadata": [], "urls": [line]})
+            else:
+                # Create a new entry with the collected metadata and this single URL.
+                entries.append({"metadata": current_metadata, "urls": [line]})
+            # We specifically DO NOT reset current_metadata here. This allows the same
+            # #EXTINF to apply to the next URL line if the file is formatted that way.
+            # It will be reset automatically when the next #EXTINF is found.
 
     return header, entries
 
 
-def report_and_clean(
-    playlists_with_content: dict,
-    health_reports: dict,
-    dead_links: set,
-    redirect_map: dict,
-) -> tuple[dict, dict, dict]:
-    print(f"\n{C.BRIGHT}--- 🧹 PHASE 3 & 4: REPORTING & CLEANING ---{C.RESET}")
-    results_db = load_json_config(RESULTS_DB_FILE, default={})
-    if results_db is None:
-        return {}, {}, {}
+def _is_entry_clean(entry: dict, scan_results: dict, rules: dict) -> tuple[bool, str]:
+    """
+    Checks if an entire channel entry is clean based on zero-tolerance rules.
+    If ANY URL within the block points to a dirty domain, the block is dirty.
+    """
+    all_lines_in_entry = entry.get("metadata", []) + entry.get("urls", [])
+    if not all_lines_in_entry:
+        return False, "Entry is empty"
 
-    rules = CONFIG.get("decision_rules", {})
-    whitelist = set(rules.get("whitelist_domains", []))
-    # This becomes our master blocklist
-    blocked_domains = {
-        domain: "Force Blocked by User"
-        for domain in rules.get("force_block_domains", [])
-    }
+    url_pattern = re.compile(r'https?://[^\s"\'<>,]+')
+    found_urls = []
+    for line in all_lines_in_entry:
+        found_urls.extend(url_pattern.findall(line))
 
-    if whitelist:
-        print(f"Ignoring {len(whitelist)} whitelisted domains.")
+    if not found_urls:
+        return False, "No URL found in entry"
 
-    # 1. Populate blocklist from scan results
-    for domain, stats in results_db.items():
-        if domain in blocked_domains or domain in whitelist:
+    max_malicious = rules.get("max_malicious_count", 0)
+    max_suspicious = rules.get("max_suspicious_count", 2)
+
+    for url in found_urls:
+        domain = get_domain_from_url(url)
+        if not domain:
             continue
 
-        reason = None
-        if stats.get("malicious", 0) >= rules.get("malicious_threshold", 1):
-            reason = f"Malicious Count ({stats.get('malicious', 0)})"
-        elif rules.get("block_on_suspicious", False) and stats.get(
-            "suspicious", 0
-        ) >= rules.get("suspicious_threshold", 5):
-            reason = f"Suspicious Count ({stats.get('suspicious', 0)})"
+        domain_stats = scan_results.get(domain)
+        if domain_stats:
+            malicious_count = domain_stats.get("malicious", 0)
+            suspicious_count = domain_stats.get("suspicious", 0)
+            if malicious_count > max_malicious or suspicious_count > max_suspicious:
+                reason = f"domain '{domain}' (Malicious: {malicious_count}, Suspicious: {suspicious_count})"
+                return False, reason
 
-        if reason:
-            blocked_domains[domain] = reason
+    return True, "All associated domains are clean"
 
-    # NOTE: The redirect chain check happens inside the loop for more precise reporting.
-    if blocked_domains:
-        print(f"Applying {len(blocked_domains)} initial blocks based on your rules.")
 
-    playlist_reports = {
-        fn: {"removed_channels": {}, "became_empty": False}
-        for fn in playlists_with_content
-    }
+def clean_and_merge_zero_tolerance(playlists_with_content: dict) -> tuple[dict, dict]:
+    """
+    Cleans all playlists, saving both individual clean files and a merged,
+    deduplicated master playlist.
+    Returns global merge stats and a detailed per-playlist report.
+    """
+    print(
+        f"\n{C.BRIGHT}--- 🧹 PHASE 3: CLEANING & MERGING (ZERO-TOLERANCE) ---{C.RESET}"
+    )
+    scan_results = load_json_config(RESULTS_DB_FILE, default={})
+    if scan_results is None:
+        print(f"{C.RED}Aborting: Could not load scan results.{C.RESET}")
+        return {}, {}
 
-    domain_cross_ref = {}
+    rules = CONFIG.get("zero_tolerance_rules", {})
+    print(
+        f"Applying rules: Max Malicious = {rules.get('max_malicious_count', 0)}, Max Suspicious = {rules.get('max_suspicious_count', 2)}"
+    )
+
+    master_content_lines = ["#EXTM3U"]
+    seen_stream_urls = set()
+    total_entries_processed = 0
+    total_discarded_count = 0
+
+    playlist_reports = {}
 
     for filename, content in playlists_with_content.items():
-        header, logical_entries = parse_m3u_to_logical_entries(content)
-        clean_output_lines = header[:]
-        malicious_removed_count = 0
-        dead_removed_count = 0
+        print(f"\n➡️  Processing '{C.CYAN}{filename}{C.RESET}'...")
+        _header, logical_entries = parse_m3u_to_logical_entries(content)
+
+        clean_entries_for_this_file = ["#EXTM3U"]
+
+        kept_this_file = 0
+        discarded_this_file = 0
+        total_in_file = len(logical_entries)
 
         for entry in logical_entries:
-            if not entry["urls"]:
+            total_entries_processed += 1
+            if not entry.get("urls"):
+                discarded_this_file += 1
                 continue
 
-            is_entry_malicious = False
-            removal_reason = ""
-            blocking_domain = ""
+            is_clean, _reason = _is_entry_clean(entry, scan_results, rules)
 
-            for url in entry["urls"]:
-                chain = redirect_map.get(url, [url])  # Get the full chain
-                for url_in_chain in chain:
-                    domain = get_domain_from_url(url_in_chain)
-                    if domain in blocked_domains:
-                        is_entry_malicious = True
-                        blocking_domain = domain
-                        # Determine the reason for the report
-                        if url_in_chain == url:
-                            removal_reason = f"Origin domain '{domain}' is blocked"
-                        else:
-                            removal_reason = f"Redirects to blocked domain '{domain}'"
-                        break  # Found a bad domain in the chain, no need to check further
-                if is_entry_malicious:
-                    break  # Found a bad URL in the entry, move to next entry
+            if is_clean:
+                clean_entries_for_this_file.extend(entry["metadata"])
+                clean_entries_for_this_file.extend(entry["urls"])
+                kept_this_file += 1
 
-            if is_entry_malicious:
-                malicious_removed_count += 1
+                primary_stream_url = entry["urls"][0]
+                if primary_stream_url not in seen_stream_urls:
+                    seen_stream_urls.add(primary_stream_url)
+                    master_content_lines.extend(entry["metadata"])
+                    master_content_lines.extend(entry["urls"])
+            else:
+                discarded_this_file += 1
 
-                if blocking_domain not in domain_cross_ref:
-                    domain_cross_ref[blocking_domain] = {
-                        "reason": blocked_domains[blocking_domain],
-                        "found_in": [],
-                    }
-                if filename not in domain_cross_ref[blocking_domain]["found_in"]:
-                    domain_cross_ref[blocking_domain]["found_in"].append(filename)
-
-                if entry["metadata"]:
-                    extinf_line = entry["metadata"][0]
-                    channel_name = ""
-                    match_tvg_name = re.search(
-                        r'tvg-name="([^"]+)"', extinf_line, re.IGNORECASE
-                    )
-                    if match_tvg_name:
-                        channel_name = match_tvg_name.group(1).strip()
-                    elif "," in extinf_line:
-                        channel_name = extinf_line.split(",")[-1].strip()
-                    if not channel_name:
-                        channel_name = "Unknown Channel"
-
-                    # Structure: { removed_channels: { blocking_domain: [ {channel: "Name", reason: "Why"}, ... ] } }
-                    if (
-                        blocking_domain
-                        not in playlist_reports[filename]["removed_channels"]
-                    ):
-                        playlist_reports[filename]["removed_channels"][
-                            blocking_domain
-                        ] = []
-
-                    playlist_reports[filename]["removed_channels"][
-                        blocking_domain
-                    ].append({"channel": channel_name, "reason": removal_reason})
-                continue  # Move to the next entry in the playlist
-
-            # This part only runs if the entry was NOT malicious
-            clean_urls_for_this_entry = []
-            for url in entry["urls"]:
-                is_dead = (
-                    CONFIG.get("features", {}).get("auto_remove_dead_links", False)
-                    and url in dead_links
-                )
-                if not is_dead:
-                    clean_urls_for_this_entry.append(url)
-                else:
-                    dead_removed_count += 1
-
-            if clean_urls_for_this_entry:
-                clean_output_lines.extend(entry["metadata"])
-                clean_output_lines.extend(clean_urls_for_this_entry)
-
-        is_now_empty = len(clean_output_lines) <= 1
-        if is_now_empty:
-            playlist_reports[filename]["became_empty"] = True
-            print(
-                f"  -> ⚠️  Processed '{C.YELLOW}{filename}{C.RESET}': Playlist is now EMPTY after removing {C.RED}{malicious_removed_count}{C.RESET} malicious entries and {C.YELLOW}{dead_removed_count}{C.RESET} dead links."
-            )
-        else:
-            print(
-                f"  -> Processed '{C.YELLOW}{filename}{C.RESET}': Discarded {C.RED}{malicious_removed_count}{C.RESET} malicious entries and {C.YELLOW}{dead_removed_count}{C.RESET} dead links. Produced clean output."
+        if kept_this_file > 0:
+            individual_clean_path = CLEAN_DIR / filename
+            individual_clean_path.write_text(
+                "\n".join(clean_entries_for_this_file) + "\n", encoding="utf-8"
             )
 
-        final_content = "\n".join(clean_output_lines)
-        (CLEAN_DIR / filename).write_text(final_content + "\n", encoding="utf-8")
+        playlist_reports[filename] = {
+            "total": total_in_file,
+            "kept": kept_this_file,
+            "discarded": discarded_this_file,
+        }
 
-    return playlist_reports, domain_cross_ref, blocked_domains
+        total_discarded_count += discarded_this_file
+        discard_color = C.GREEN if discarded_this_file == 0 else C.YELLOW
+        print(
+            f"  -> Results: Kept {C.GREEN}{kept_this_file}{C.RESET} clean entries, Discarded {discard_color}{discarded_this_file}{C.RESET} entries."
+        )
+
+    master_playlist_path = CLEAN_DIR / "_MASTER_PLAYLIST.m3u"
+    master_playlist_path.write_text(
+        "\n".join(master_content_lines) + "\n", encoding="utf-8"
+    )
+
+    final_channel_count = len(seen_stream_urls)
+
+    print(f"\n{C.BRIGHT}--- ✅ Processing complete! ---{C.RESET}")
+    print(f"   -> Total channel entries processed: {total_entries_processed}")
+    print(f"   -> Total entries discarded: {C.YELLOW}{total_discarded_count}{C.RESET}")
+    print(
+        f"   -> Total unique clean channels saved to master: {C.GREEN}{final_channel_count}{C.RESET}"
+    )
+    print(f"   -> Your clean playlists are in '{C.CYAN}{CLEAN_DIR.name}/{C.RESET}'")
+
+    merge_stats = {
+        "processed": total_entries_processed,
+        "discarded": total_discarded_count,
+        "final_count": final_channel_count,
+    }
+
+    return merge_stats, playlist_reports

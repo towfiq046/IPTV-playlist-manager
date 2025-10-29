@@ -69,9 +69,12 @@ DEFAULT_CONFIG = {
         "whitelist_domains": ["example.com"],
         "force_block_domains": [],
     },
+    "zero_tolerance_rules": {
+        "max_malicious_count": 0,
+        "max_suspicious_count": 2,
+    },
     "features": {
         "check_link_health": True,
-        "auto_remove_dead_links": True,
         "rescan_results_after_days": 30,
         "recheck_disabled_after_days": 7,
     },
@@ -293,7 +296,9 @@ def get_quota_tracker() -> ApiQuotaTracker:
 def initialize_project():
     """Initializes project directories, loads environment variables, and sets up the quota tracker."""
     print(f"{C.BRIGHT}{C.MAGENTA}============================================{C.RESET}")
-    print(f"{C.BRIGHT}{C.MAGENTA}=== Hybrid Playlist Scanner v4.6 (Final) ==={C.RESET}")
+    print(
+        f"{C.BRIGHT}{C.MAGENTA}=== Hybrid Playlist Scanner v5.0 (ZT)    ==={C.RESET}"
+    )  # MODIFIED
     print(f"{C.BRIGHT}{C.MAGENTA}============================================{C.RESET}")
 
     import os

@@ -26,33 +26,25 @@ def parse_m3u_to_logical_entries(content: str) -> tuple[list, list]:
             continue
 
         if line_stripped.startswith("#"):
-            # If we find new #EXTINF metadata, it signals the start of a new channel block.
-            # We discard the previous metadata, as it should have been consumed by a URL.
             if line_stripped.startswith("#EXTINF"):
                 current_metadata = [line]
             else:
                 current_metadata.append(line)
 
         elif line_stripped.startswith("http"):
-            # A URL line finalizes an entry.
             if not current_metadata:
-                # This is an orphaned URL with no #EXTINF. Treat it as its own entry.
-                # While not ideal, we process it to ensure it gets scanned.
                 entries.append({"metadata": [], "urls": [line]})
             else:
-                # Create a new entry with the collected metadata and this single URL.
                 entries.append({"metadata": current_metadata, "urls": [line]})
-            # We specifically DO NOT reset current_metadata here. This allows the same
-            # #EXTINF to apply to the next URL line if the file is formatted that way.
-            # It will be reset automatically when the next #EXTINF is found.
 
     return header, entries
 
 
 def _is_entry_clean(entry: dict, scan_results: dict, rules: dict) -> tuple[bool, str]:
     """
-    Checks if an entire channel entry is clean based on zero-tolerance rules.
-    If ANY URL within the block points to a dirty domain, the block is dirty.
+    Checks if a channel entry is clean.
+    An entry is considered UNCLEAN if ANY URL within it points to a domain that is
+    either confirmed malicious/suspicious OR has not been successfully scanned.
     """
     all_lines_in_entry = entry.get("metadata", []) + entry.get("urls", [])
     if not all_lines_in_entry:
@@ -75,12 +67,16 @@ def _is_entry_clean(entry: dict, scan_results: dict, rules: dict) -> tuple[bool,
             continue
 
         domain_stats = scan_results.get(domain)
-        if domain_stats:
-            malicious_count = domain_stats.get("malicious", 0)
-            suspicious_count = domain_stats.get("suspicious", 0)
-            if malicious_count > max_malicious or suspicious_count > max_suspicious:
-                reason = f"domain '{domain}' (Malicious: {malicious_count}, Suspicious: {suspicious_count})"
-                return False, reason
+        # If a domain is not in the results DB, its status is unknown.
+        # For zero-tolerance, unknown is treated as unsafe.
+        if not domain_stats:
+            return False, f"domain '{domain}' has not been successfully scanned"
+
+        malicious_count = domain_stats.get("malicious", 0)
+        suspicious_count = domain_stats.get("suspicious", 0)
+        if malicious_count > max_malicious or suspicious_count > max_suspicious:
+            reason = f"domain '{domain}' (Malicious: {malicious_count}, Suspicious: {suspicious_count})"
+            return False, reason
 
     return True, "All associated domains are clean"
 
@@ -102,6 +98,9 @@ def clean_and_merge_zero_tolerance(playlists_with_content: dict) -> tuple[dict, 
     rules = CONFIG.get("zero_tolerance_rules", {})
     print(
         f"Applying rules: Max Malicious = {rules.get('max_malicious_count', 0)}, Max Suspicious = {rules.get('max_suspicious_count', 2)}"
+    )
+    print(
+        f"{C.YELLOW}NOTE: Any entry with a domain that hasn't been scanned will be DISCARDED.{C.RESET}"
     )
 
     master_content_lines = ["#EXTM3U"]
@@ -182,3 +181,7 @@ def clean_and_merge_zero_tolerance(playlists_with_content: dict) -> tuple[dict, 
     }
 
     return merge_stats, playlist_reports
+
+
+
+

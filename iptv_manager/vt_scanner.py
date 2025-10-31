@@ -4,7 +4,7 @@ import json
 import logging
 import os
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse  # NEW
+from urllib.parse import urlparse
 
 import aiohttp
 from dotenv import load_dotenv
@@ -18,9 +18,6 @@ from .config_loader import (
     get_config,
     load_json_config,
 )
-
-# MODIFIED: get_domain_from_url no longer needed here
-# from .utils import get_domain_from_url
 
 CONFIG = get_config()
 load_dotenv(dotenv_path=ENV_FILE)
@@ -59,38 +56,45 @@ async def handle_429_error(response):
         return False
 
 
-async def submit_url_for_analysis(session, url, headers):
-    """Submits a URL to VirusTotal for scanning if it's not already known."""
+async def submit_url_for_analysis(session, url, headers) -> bool:
+    """
+    Submits a URL to VirusTotal for scanning if it's not already known.
+    Returns True on success, False on failure.
+    """
     global URLS_SUBMITTED_THIS_RUN
     submit_url = "https://www.virustotal.com/api/v3/urls"
     payload = {"url": url}
+    domain_of_url = urlparse(url).netloc
     try:
-        # --- MODIFIED: Log the domain from the representative url ---
-        domain_of_url = urlparse(url).netloc
         async with session.post(submit_url, headers=headers, data=payload) as response:
             if response.status == 200:
                 logging.info(
                     f"Successfully submitted new URL for {domain_of_url} for analysis."
                 )
                 URLS_SUBMITTED_THIS_RUN += 1
-            elif response.status == 429:
-                logging.warning("Rate limit hit while submitting URL. Will not retry.")
+                return True
+            # This specific 400 error is not a failure; it means the URL is already known to VT
+            # and likely has a report, even if it returned 404 moments ago.
             elif response.status == 400 and "already exists" in (await response.text()):
                 logging.debug(
                     f"URL for {domain_of_url} was already submitted recently."
                 )
+                return True
             else:
                 logging.warning(
-                    f"Failed to submit URL for {domain_of_url}. Status: {response.status}"
+                    f"Failed to submit URL for {domain_of_url}. Status: {response.status}. It will be re-queued."
                 )
+                return False
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         logging.error(f"NETWORK ERROR during URL submission: {e}")
+        return False
 
 
 async def process_url(session, domain, url, semaphore):
     """
-    Fetches the scan report for a single URL from VirusTotal and returns a
-    standardized record.
+    Fetches the scan report for a single URL from VirusTotal.
+    Returns a result ONLY if the scan is definitive. Otherwise, returns None
+    to keep the domain in the scan queue.
     """
     if QUOTA_EXHAUSTED:
         return domain, None
@@ -99,7 +103,6 @@ async def process_url(session, domain, url, semaphore):
         url_id = hashlib.sha256(url.encode()).hexdigest()
         report_url = f"https://www.virustotal.com/api/v3/urls/{url_id}"
         headers = {"x-apikey": API_KEY}
-        vt_stats = None  # This will hold the raw dict from the VT API
 
         try:
             async with session.get(report_url, headers=headers) as response:
@@ -110,33 +113,39 @@ async def process_url(session, domain, url, semaphore):
                         .get("attributes", {})
                         .get("last_analysis_stats")
                     )
+                    # We have a definitive result, create a record
+                    if vt_stats is not None:
+                        final_record = {
+                            "malicious": vt_stats.get("malicious", 0),
+                            "suspicious": vt_stats.get("suspicious", 0),
+                            "last_scanned": datetime.now(timezone.utc).isoformat(),
+                        }
+                        return domain, final_record
+
                 elif response.status == 404:
+                    # Report not found. We must submit it and check again next time.
+                    # We do NOT create a default record. It remains unscanned.
                     logging.info(
-                        f"No report for {domain}. Submitting and creating clean record."
+                        f"No report for {domain}. Submitting URL to VT for future analysis."
                     )
                     await submit_url_for_analysis(session, url, headers)
-                    # Create a default 'clean' stats object to record the check
-                    vt_stats = {"malicious": 0, "suspicious": 0}
+                    return domain, None  # <-- Return None to keep it in the queue
+
                 elif response.status == 429 and await handle_429_error(response):
                     return domain, None  # Quota fully exhausted
+
                 elif response.status == 401:
                     logging.error("VirusTotal API Key is invalid or unauthorized.")
-                elif response.status != 404:
-                    logging.warning(f"Unexpected status {response.status} for {domain}")
+                else:
+                    logging.warning(
+                        f"Unexpected status {response.status} for {domain}. It will be re-queued."
+                    )
+
         except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as e:
-            # Catch RuntimeError here as well to handle the "Session is closed" case gracefully within the task
             logging.error(f"NETWORK ERROR for {domain}: {e}")
-            return domain, None
 
-        # If we got any stats (from API or our default), create our final, standardized record
-        if vt_stats is not None:
-            final_record = {
-                "malicious": vt_stats.get("malicious", 0),
-                "suspicious": vt_stats.get("suspicious", 0),
-                "last_scanned": datetime.now(timezone.utc).isoformat(),
-            }
-            return domain, final_record
-
+        # Any path that doesn't return a final_record will end up here.
+        # This ensures failed or incomplete scans are always re-queued.
         return domain, None
 
 
@@ -158,11 +167,10 @@ def _save_scan_progress(results_db: dict, remaining_domains: set):
         SCAN_QUEUE_FILE.unlink()
 
 
-def _determine_domains_to_scan(  # MODIFIED: Renamed variable for clarity
+def _determine_domains_to_scan(
     master_domain_list: set, results_db: dict, force_rescan: bool
 ) -> set:
     """Determines which domains need scanning based on cache, expiry, and user flags."""
-    # Priority 1: Resume from an incomplete scan
     if SCAN_QUEUE_FILE.exists():
         print(f"{C.YELLOW}Found an incomplete scan queue.{C.RESET}")
         choice = input("Do you want to resume the previous scan? (y/n): ").lower()
@@ -170,25 +178,30 @@ def _determine_domains_to_scan(  # MODIFIED: Renamed variable for clarity
             try:
                 domains_to_scan = set(json.loads(SCAN_QUEUE_FILE.read_text()))
                 print(f"Resuming scan with {len(domains_to_scan)} domains remaining.")
+                # Also add any brand new domains from the current playlists
+                new_domains = master_domain_list - set(results_db.keys())
+                if new_domains:
+                    print(
+                        f"Adding {len(new_domains)} newly discovered domains to the queue."
+                    )
+                    domains_to_scan.update(new_domains)
                 return domains_to_scan
             except (json.JSONDecodeError, FileNotFoundError):
                 print(f"{C.RED}Error reading queue. Starting fresh.{C.RESET}")
-        SCAN_QUEUE_FILE.unlink(missing_ok=True)  # Clean up if not resuming
+        SCAN_QUEUE_FILE.unlink(missing_ok=True)
 
-    # Priority 2: Force a full rescan of everything
     if force_rescan:
         print(
             f"{C.YELLOW}Forcing a full rescan of all {len(master_domain_list)} domains.{C.RESET}"
         )
         return master_domain_list
 
-    # Priority 3: Standard scan (new and expired domains)
     domains_to_scan = set()
     rescan_days = CONFIG.get("features", {}).get("rescan_results_after_days", 30)
     expiry_date_threshold = datetime.now(timezone.utc) - timedelta(days=rescan_days)
     expired_count = 0
 
-    for domain in master_domain_list:  # MODIFIED: using master list
+    for domain in master_domain_list:
         if domain not in results_db:
             domains_to_scan.add(domain)
         else:
@@ -201,12 +214,10 @@ def _determine_domains_to_scan(  # MODIFIED: Renamed variable for clarity
                     domains_to_scan.add(domain)
                     expired_count += 1
             except (ValueError, TypeError):
-                domains_to_scan.add(domain)  # Rescan if date is invalid
+                domains_to_scan.add(domain)
 
     new_count = len(domains_to_scan) - expired_count
-    logging.info(
-        f"Found {C.CYAN}{len(master_domain_list)}{C.RESET} unique domains."
-    )  # MODIFIED
+    logging.info(f"Found {C.CYAN}{len(master_domain_list)}{C.RESET} unique domains.")
     if new_count > 0:
         logging.info(f"-> {C.GREEN}{new_count}{C.RESET} are new.")
     if expired_count > 0:
@@ -221,10 +232,7 @@ async def _run_scanner_loop(
     domains_to_scan: set, domain_to_rep_url: dict, results_db: dict
 ) -> int:
     """The main asynchronous loop that manages and executes the scans."""
-
-    # 1. Prune the scan queue of any domains that are no longer relevant.
     original_queued_count = len(domains_to_scan)
-    # This keeps only the domains that are BOTH in the queue AND in the current master list.
     domains_to_scan.intersection_update(domain_to_rep_url.keys())
     pruned_count = original_queued_count - len(domains_to_scan)
 
@@ -233,10 +241,8 @@ async def _run_scanner_loop(
             f"Skipped {pruned_count} stale domains from the queue that are no longer in the playlists."
         )
 
-    # 2. If after pruning there's nothing left to do, exit gracefully.
     if not domains_to_scan:
-        logging.info("All remaining domains in the queue were stale. Nothing to scan.")
-        # Clean up the old queue file
+        logging.info("All domains are accounted for. Nothing to scan.")
         if SCAN_QUEUE_FILE.exists():
             SCAN_QUEUE_FILE.unlink()
         return 0
@@ -257,8 +263,6 @@ async def _run_scanner_loop(
             tasks = [
                 process_url(session, domain, domain_to_rep_url[domain], semaphore)
                 for domain in domains_to_scan
-                # The safety check below is now redundant because of our prune step,
-                # but it's good practice to keep it.
                 if domain in domain_to_rep_url
             ]
             for future in asyncio.as_completed(tasks):
@@ -266,33 +270,31 @@ async def _run_scanner_loop(
                 try:
                     domain, stats = await future
                 except Exception as e:
-                    logging.error(
-                        f"A scanner task failed unexpectedly: {e}. The script will continue."
-                    )
+                    logging.error(f"A scanner task failed unexpectedly: {e}")
 
                 pbar.update(1)
 
-                # This part is for the temporary rate limit, which we will keep
                 if QUOTA_EXHAUSTED:
                     pbar.set_description_str(f"{C.RED}SCAN ABORTED (Quota){C.RESET}")
                     break
 
-                if domain:
+                if domain and stats:
+                    # This is a successful, definitive scan.
+                    # Save the result and remove it from the "to-do" list.
+                    results_db[domain] = stats
                     remaining_domains.discard(domain)
-                    if stats:
-                        results_db[domain] = stats
-                        new_results_count += 1
-                        if new_results_count % BATCH_SAVE_SIZE == 0:
-                            _save_scan_progress(results_db, remaining_domains)
-                            pbar.set_description_str(
-                                f"{C.CYAN}🚀 Scanning Domains (Progress Saved){C.RESET}"
-                            )
+                    new_results_count += 1
+                    if new_results_count % BATCH_SAVE_SIZE == 0:
+                        _save_scan_progress(results_db, remaining_domains)
+                        pbar.set_description_str(
+                            f"{C.CYAN}🚀 Scanning Domains (Progress Saved){C.RESET}"
+                        )
     finally:
         pbar.close()
         _save_scan_progress(results_db, remaining_domains)
         if remaining_domains and not QUOTA_EXHAUSTED:
             print(
-                f"\n{C.YELLOW}Scan interrupted. Run again to resume from where you left off.{C.RESET}"
+                f"\n{C.YELLOW}Scan interrupted or some URLs failed to scan. Run again to resume.{C.RESET}"
             )
 
     return new_results_count
@@ -317,7 +319,6 @@ def scan_playlists(
 
     print(f"\n{C.BRIGHT}--- 🛡️  PHASE 2: SCANNING DOMAINS ---{C.RESET}")
 
-    # 1. Load database and determine scan scope
     results_db = load_json_config(RESULTS_DB_FILE, default={})
     if results_db is None:
         return 0, 0
@@ -330,7 +331,6 @@ def scan_playlists(
         logging.info("No new or expired domains to scan. Database is up-to-date.")
         return 0, 0
 
-    # 3. Run the scanner
     new_results_count = asyncio.run(
         _run_scanner_loop(domains_to_scan, domain_to_rep_url, results_db)
     )
@@ -338,8 +338,7 @@ def scan_playlists(
     scan_status = "finished"
     if QUOTA_EXHAUSTED:
         scan_status = "aborted due to quota"
-    # Check if the queue file still exists and has content.
-    elif SCAN_QUEUE_FILE.exists() and SCAN_QUEUE_FILE.stat().st_size > 0:
+    elif SCAN_QUEUE_FILE.exists() and SCAN_QUEUE_FILE.stat().st_size > 2:
         scan_status = "interrupted"
 
     logging.info(
